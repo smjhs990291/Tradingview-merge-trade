@@ -4,9 +4,10 @@ import math
 import os
 import re
 from dataclasses import dataclass
-from typing import Dict, Iterable, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 import pandas as pd
+import numpy as np
 
 try:
     import tkinter as tk
@@ -25,9 +26,9 @@ class FileMeta:
     initial_capital: Optional[float]
 
 
-TRADE_SHEET_NAME = "交易清單"
-ATTR_SHEET_NAME = "屬性"
-PERF_SHEET_NAME = "績效"
+TRADE_SHEET_NAMES = ["交易清單", "List of trades"]
+ATTR_SHEET_NAMES = ["屬性", "Properties"]
+PERF_SHEET_NAMES = ["績效", "Performance"]
 
 
 def _timeframe_to_minutes(timeframe: Optional[str]) -> Optional[int]:
@@ -40,11 +41,11 @@ def _timeframe_to_minutes(timeframe: Optional[str]) -> Optional[int]:
         return None
 
     n = int(m.group(1))
-    if "分鐘" in tf:
+    if "分鐘" in tf or "minutes" in tf:
         return n
-    if "小時" in tf:
+    if "小時" in tf or "hours" in tf:
         return n * 60
-    if "天" in tf:
+    if "天" in tf or "days" in tf:
         return n * 60 * 24
     return None
 
@@ -58,12 +59,20 @@ def _safe_float(v) -> Optional[float]:
         return None
 
 
-def _read_attributes(xlsx_path: str) -> Dict[str, object]:
+def _read_first_available_sheet(xlsx_path: str, sheet_names: List[str]) -> pd.DataFrame:
     try:
-        df = pd.read_excel(xlsx_path, sheet_name=ATTR_SHEET_NAME)
+        xl = pd.ExcelFile(xlsx_path)
+        available = set(xl.sheet_names)
+        for name in sheet_names:
+            if name in available:
+                return pd.read_excel(xl, sheet_name=name)
     except Exception:
-        return {}
+        pass
+    return pd.DataFrame()
 
+
+def _read_attributes(xlsx_path: str) -> Dict[str, object]:
+    df = _read_first_available_sheet(xlsx_path, ATTR_SHEET_NAMES)
     if "name" not in df.columns or "value" not in df.columns:
         return {}
 
@@ -78,11 +87,7 @@ def _read_attributes(xlsx_path: str) -> Dict[str, object]:
 
 
 def _read_initial_capital(xlsx_path: str) -> Optional[float]:
-    try:
-        df = pd.read_excel(xlsx_path, sheet_name=PERF_SHEET_NAME)
-    except Exception:
-        return None
-
+    df = _read_first_available_sheet(xlsx_path, PERF_SHEET_NAMES)
     if "Unnamed: 0" not in df.columns:
         return None
 
@@ -91,7 +96,7 @@ def _read_initial_capital(xlsx_path: str) -> Optional[float]:
     if row.empty:
         return None
 
-    for candidate_col in ["全部 USD", "全部USD", "全部"]:
+    for candidate_col in ["全部 USD", "全部USD", "全部", "All USD", "AllUSD", "All"]:
         if candidate_col in df.columns:
             return _safe_float(row.iloc[0][candidate_col])
 
@@ -105,13 +110,14 @@ def _read_initial_capital(xlsx_path: str) -> Optional[float]:
 def read_file_meta(xlsx_path: str) -> FileMeta:
     attrs = _read_attributes(xlsx_path)
 
-    symbol = attrs.get("商品")
+    # Try Chinese keys then English keys
+    symbol = attrs.get("商品") or attrs.get("Symbol")
     symbol = str(symbol).strip() if symbol is not None and not pd.isna(symbol) else None
 
-    timeframe = attrs.get("時間週期")
+    timeframe = attrs.get("時間週期") or attrs.get("Timeframe")
     timeframe = str(timeframe).strip() if timeframe is not None and not pd.isna(timeframe) else None
 
-    point_value = _safe_float(attrs.get("點值"))
+    point_value = _safe_float(attrs.get("點值") or attrs.get("Point value"))
     initial_capital = _read_initial_capital(xlsx_path)
 
     return FileMeta(
@@ -124,11 +130,7 @@ def read_file_meta(xlsx_path: str) -> FileMeta:
 
 
 def read_trade_list(xlsx_path: str, meta: FileMeta) -> pd.DataFrame:
-    try:
-        df = pd.read_excel(xlsx_path, sheet_name=TRADE_SHEET_NAME)
-    except Exception:
-        return pd.DataFrame()
-
+    df = _read_first_available_sheet(xlsx_path, TRADE_SHEET_NAMES)
     df = df.copy()
 
     df.columns = [str(c).strip() for c in df.columns]
@@ -143,6 +145,21 @@ def read_trade_list(xlsx_path: str, meta: FileMeta) -> pd.DataFrame:
         "MAE %": "回撤 %",
         "累 積損益 %": "累積損益 %",
         "累積損益%": "累積損益 %",
+        # English mappings
+        "Trade #": "交易 #",
+        "Type": "類型",
+        "Signal": "訊號",
+        "Price USD": "價格 USD",
+        "Position size (qty)": "持倉大小(數量)",
+        "Position size (value)": "持倉大小(值)",
+        "Net P&L USD": "淨損益 USD",
+        "Net P&L %": "淨損益 %",
+        "Favorable excursion USD": "上漲幅度 USD",
+        "Favorable excursion %": "上漲幅度 %",
+        "Adverse excursion USD": "回撤 USD",
+        "Adverse excursion %": "回撤 %",
+        "Cumulative P&L USD": "累積損益 USD",
+        "Cumulative P&L %": "累積損益 %"
     }
     df = df.rename(columns={k: v for k, v in rename_map.items() if k in df.columns})
 
@@ -184,23 +201,23 @@ def is_closed_trade_row(trade_type: object) -> bool:
     if trade_type is None or pd.isna(trade_type):
         return False
     t = str(trade_type)
-    return "出場" in t
+    return "出場" in t or "Exit" in t
 
 
 def is_entry_trade_row(trade_type: object) -> bool:
     if trade_type is None or pd.isna(trade_type):
         return False
     t = str(trade_type)
-    return "進場" in t
+    return "進場" in t or "Entry" in t
 
 
 def trade_direction(trade_type: object) -> Optional[str]:
     if trade_type is None or pd.isna(trade_type):
         return None
-    t = str(trade_type)
-    if "做多" in t:
+    t = str(trade_type).lower()
+    if "做多" in t or "long" in t:
         return "long"
-    if "做空" in t:
+    if "做空" in t or "short" in t:
         return "short"
     return None
 
@@ -302,7 +319,8 @@ def _drawdown_episodes(equity_curve: pd.DataFrame) -> Tuple[List[Dict[str, objec
                 )
                 if depth > max_dd_val:
                     max_dd_val = depth
-                    max_dd_pct = (depth / peak_val * 100.0) if peak_val != 0 else 0.0
+                    # CORRECTIVE: Relative drawdown calculation
+                    max_dd_pct = (depth / peak_val * 100.0) if peak_val > 0 else 0.0
             peak_val = v
             peak_time = t
             in_dd = False
@@ -332,7 +350,8 @@ def _drawdown_episodes(equity_curve: pd.DataFrame) -> Tuple[List[Dict[str, objec
         )
         if depth > max_dd_val:
             max_dd_val = depth
-            max_dd_pct = (depth / peak_val * 100.0) if peak_val != 0 else 0.0
+            # CORRECTIVE: Relative drawdown calculation
+            max_dd_pct = (depth / peak_val * 100.0) if peak_val > 0 else 0.0
 
     return episodes, float(max_dd_val), float(max_dd_pct)
 
@@ -470,6 +489,21 @@ def _subset_stats(exit_df: pd.DataFrame, initial_capital: float) -> Dict[str, ob
     max_win_pct = float(pnl_pct.max()) if trades and pnl_pct is not None else float("nan")
     max_loss_pct = float(abs(pnl_pct.min())) if trades and pnl_pct is not None else float("nan")
 
+    # POSITION-VALUE BASED METRICS (Prop Firm Efficiency)
+    # Formula: (Net P&L / Position Value) * 100
+    pos_val_raw = exit_df.get("持倉大小(值)")
+    if pos_val_raw is not None and isinstance(pos_val_raw, pd.Series):
+        pos_val = pd.to_numeric(pos_val_raw, errors="coerce")
+        if not pos_val.isna().all():
+            # Avoid division by zero
+            valid_pos = (pos_val != 0)
+            pnl_val_pct = (pnl[valid_pos] / pos_val[valid_pos] * 100.0)
+            avg_pos_efficiency = float(pnl_val_pct.mean()) if not pnl_val_pct.empty else 0.0
+        else:
+            avg_pos_efficiency = float("nan")
+    else:
+        avg_pos_efficiency = float("nan")
+
     return {
         "trades": trades,
         "wins": wins,
@@ -493,13 +527,14 @@ def _subset_stats(exit_df: pd.DataFrame, initial_capital: float) -> Dict[str, ob
         "max_win_pct": max_win_pct,
         "max_loss": max_loss,
         "max_loss_pct": max_loss_pct,
+        "avg_pos_efficiency": avg_pos_efficiency, # NEW
     }
 
 
 def build_report_tables(
     merged_trades: pd.DataFrame,
     base_attrs: Optional[pd.DataFrame],
-) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, Dict[str, Any]]:
     if merged_trades.empty:
         empty = pd.DataFrame()
         return empty, empty, empty, empty, empty
@@ -523,8 +558,26 @@ def build_report_tables(
     ]
 
     trade_list_out = merged_trades.copy()
+    if "日期/時間" in trade_list_out.columns:
+        trade_list_out["日期/時間"] = pd.to_datetime(trade_list_out["日期/時間"], errors="coerce")
+    
+    # Global sort to ensure the final list is strictly chronological
+    trade_list_out = trade_list_out.sort_values("日期/時間", na_position="last").copy()
+    
     if "交易 #" in trade_list_out.columns and "商品" in trade_list_out.columns:
         trade_list_out["交易 #"] = trade_list_out["商品"].astype(str) + "-" + trade_list_out["交易 #"].astype(str)
+    
+    # Recompute cumulative metrics for the Excel tab to avoid "Reset" jumps
+    temp_initial_capital = float(pd.to_numeric(merged_trades.get("初始資本"), errors="coerce").dropna().unique().sum())
+    if not temp_initial_capital:
+        temp_initial_capital = float(pd.to_numeric(merged_trades.get("初始資本"), errors="coerce").fillna(0.0).max())
+        
+    if "淨損益 USD" in trade_list_out.columns:
+        pnl_series = pd.to_numeric(trade_list_out["淨損益 USD"], errors="coerce").fillna(0.0)
+        trade_list_out["累積損益 USD"] = pnl_series.cumsum()
+        if temp_initial_capital:
+            trade_list_out["累積損益 %"] = (trade_list_out["累積損益 USD"] / temp_initial_capital * 100.0)
+
     trade_list_out = trade_list_out[[c for c in original_trade_cols if c in trade_list_out.columns]].copy()
 
     entries = merged_trades[merged_trades["類型"].apply(is_entry_trade_row)].copy()
@@ -544,6 +597,24 @@ def build_report_tables(
     open_trades = int(len(open_keys))
 
     exits = exits.copy()
+    if "日期/時間" in exits.columns:
+        exits["日期/時間"] = pd.to_datetime(exits["日期/時間"], errors="coerce")
+    
+    # GLOBAL RE-SORT to fix temporal continuity
+    exits = exits.sort_values("日期/時間", na_position="last").copy()
+    
+    # RE-CALCULATE CUMULATIVE METRICS (Fix Reset Issue)
+    pnl_usd = pd.to_numeric(exits.get("淨損益 USD"), errors="coerce").fillna(0.0)
+    pos_value = pd.to_numeric(exits.get("持倉大小(值)"), errors="coerce")
+    
+    exits["點值"] = pd.to_numeric(exits.get("點值"), errors="coerce").fillna(0.0)
+    exits["累積損益 USD"] = pnl_usd.cumsum()
+    exits["累積損益 %"] = (exits["累積損益 USD"] / initial_capital * 100.0) if initial_capital else 0.0
+    
+    # RE-CALCULATE Trade-level % based on Position Value (User Request)
+    if pos_value is not None:
+        exits["淨損益 %"] = (pnl_usd / pos_value * 100.0).fillna(0.0)
+
     exits["方向"] = exits["類型"].apply(trade_direction)
     exit_all = exits
     exit_long = exits[exits["方向"] == "long"]
@@ -554,9 +625,12 @@ def build_report_tables(
     stats_short = _subset_stats(exit_short, initial_capital)
 
     if "持倉大小(數量)" in merged_trades.columns:
-        max_contracts_all = float(pd.to_numeric(merged_trades["持倉大小(數量)"], errors="coerce").abs().max())
-        max_contracts_long = float(pd.to_numeric(merged_trades.loc[merged_trades["類型"].astype(str).str.contains("做多", na=False), "持倉大小(數量)"], errors="coerce").abs().max())
-        max_contracts_short = float(pd.to_numeric(merged_trades.loc[merged_trades["類型"].astype(str).str.contains("做空", na=False), "持倉大小(數量)"], errors="coerce").abs().max())
+        contracts_series = pd.to_numeric(merged_trades["持倉大小(數量)"], errors="coerce")
+        max_contracts_all = float(contracts_series.abs().max())
+        
+        trade_types = merged_trades.get("類型", pd.Series(dtype=str)).astype(str)
+        max_contracts_long = float(contracts_series[trade_types.str.contains("做多", na=False)].abs().max())
+        max_contracts_short = float(contracts_series[trade_types.str.contains("做空", na=False)].abs().max())
     else:
         max_contracts_all = float("nan")
         max_contracts_long = float("nan")
@@ -683,6 +757,7 @@ def build_report_tables(
         ("夏普比率", round(sharpe, 3) if sharpe is not None else float("nan"), float("nan"), float("nan"), float("nan"), float("nan"), float("nan")),
         ("索提諾比率", round(sortino, 3) if sortino is not None else float("nan"), float("nan"), float("nan"), float("nan"), float("nan"), float("nan")),
         ("獲利因子", round(stats_all["profit_factor"], 3), float("nan"), round(stats_long["profit_factor"], 3), float("nan"), round(stats_short["profit_factor"], 3), float("nan")),
+        ("持倉平均回報 (Efficiency)", float("nan"), round(stats_all["avg_pos_efficiency"], 4), float("nan"), float("nan"), float("nan"), float("nan")),
         ("追加保證金", 0.0, float("nan"), 0.0, float("nan"), 0.0, float("nan")),
     ]
     risk = pd.DataFrame(
@@ -690,14 +765,11 @@ def build_report_tables(
         columns=["Unnamed: 0", "全部 USD", "全部 %", "看多 USD", "看多 %", "看空 USD", "看空 %"],
     )
 
-    if "日期/時間" in merged_trades.columns:
-        trade_range = merged_trades.dropna(subset=["日期/時間"]).sort_values("日期/時間")["日期/時間"]
-        if not trade_range.empty:
-            start = trade_range.iloc[0]
-            end = trade_range.iloc[-1]
-            trade_range_str = f"{start.year}年{start.month:02d}月{start.day:02d}日, {start.hour:02d}:{start.minute:02d} — {end.year}年{end.month:02d}月{end.day:02d}日, {end.hour:02d}:{end.minute:02d}"
-        else:
-            trade_range_str = ""
+    trade_range = merged_trades.dropna(subset=["日期/時間"]).sort_values("日期/時間")["日期/時間"]
+    if not trade_range.empty:
+        start = trade_range.iloc[0]
+        end = trade_range.iloc[-1]
+        trade_range_str = f"{start.year}年{start.month:02d}月{start.day:02d}日, {start.hour:02d}:{start.minute:02d} — {end.year}年{end.month:02d}月{end.day:02d}日, {end.hour:02d}:{end.minute:02d}"
     else:
         trade_range_str = ""
 
@@ -749,7 +821,7 @@ def build_report_tables(
         )
         attrs = pd.concat([attrs, pd.DataFrame([{ "name": "資料品質警告", "value": warning }])], ignore_index=True)
 
-    return perf, analysis, risk, trade_list_out, attrs
+    return perf, analysis, risk, trade_list_out, attrs, equity_curve, stats_all
 
 
 def _max_drawdown_from_pnl(pnl_series: pd.Series) -> float:
@@ -809,6 +881,95 @@ def summarize_closed_trades(closed_df: pd.DataFrame, group_key: str) -> pd.DataF
 
     out = pd.DataFrame(rows)
     return out.sort_values([group_key])
+
+
+def generate_quant_audit_reports(merged_df: pd.DataFrame, output_dir: str):
+    """
+    量化審計專用模組：強制計算投資組合相關性與 MFE/MAE 效率。
+    """
+    print("==================================================")
+    print("[Quant Auditor] INITIATING STATISTICAL PROCESSING")
+    print("==================================================")
+    
+    # 1. 欄位容錯處理
+    col_date = '日期/時間' if '日期/時間' in merged_df.columns else 'Date and time'
+    col_pnl_pct = '淨損益 %' if '淨損益 %' in merged_df.columns else 'Net P&L %'
+    col_mae_pct = '回撤 %' if '回撤 %' in merged_df.columns else 'Adverse excursion %'
+    col_trade_id = '交易 #' if '交易 #' in merged_df.columns else 'Trade #'
+    
+    if col_date not in merged_df.columns or col_pnl_pct not in merged_df.columns:
+        print("[Quant Auditor ERROR] Required columns missing. Aborting analysis.")
+        print(f"Available columns: {merged_df.columns.tolist()}")
+        return
+
+    df = merged_df.copy()
+    
+    # 確保資料型態正確
+    df[col_date] = pd.to_datetime(df[col_date], errors='coerce')
+    df[col_pnl_pct] = pd.to_numeric(df[col_pnl_pct].astype(str).str.replace('%', ''), errors='coerce').fillna(0)
+    df[col_mae_pct] = pd.to_numeric(df[col_mae_pct].astype(str).str.replace('%', ''), errors='coerce').fillna(0)
+    
+    # 提取商品代碼 (Symbol)
+    # 優先從 '商品' 欄位讀取，若無則從 '交易 #' 提取 (相容 TV 原始格式)
+    if '商品' in df.columns:
+        df['Symbol'] = df['商品'].astype(str).str.strip()
+    
+    if 'Symbol' not in df.columns or (df['Symbol'] == 'Unknown').all():
+        df['Symbol'] = df[col_trade_id].astype(str).apply(
+            lambda x: x.split('-')[0].split(':')[-1] if '-' in x else 'Unknown'
+        )
+
+    # ---------------------------------------------------------
+    # REPORT 1: 每日收益率相關性矩陣 (Daily Returns Correlation)
+    # ---------------------------------------------------------
+    print("[Quant Auditor] Calculating Pearson Correlation Matrix...")
+    df['Date_Only'] = df[col_date].dt.date
+    daily_returns = df.groupby(['Date_Only', 'Symbol'])[col_pnl_pct].sum().reset_index()
+    
+    # 建立時間序列矩陣
+    pivot_returns = daily_returns.pivot(index='Date_Only', columns='Symbol', values=col_pnl_pct)
+    pivot_returns = pivot_returns.fillna(0) # 無交易日視為 0 收益
+    
+    # 計算相關性
+    corr_matrix = pivot_returns.corr(method='pearson')
+    
+    # ---------------------------------------------------------
+    # REPORT 2: MAE 止損效率分析 (Microstructure MAE Profile)
+    # ---------------------------------------------------------
+    print("[Quant Auditor] Profiling Maximum Adverse Excursion (MAE) for Winning Trades...")
+    winning_trades = df[df[col_pnl_pct] > 0]
+    
+    mae_stats = []
+    for symbol, group in winning_trades.groupby('Symbol'):
+        mae_series = np.abs(group[col_mae_pct]) # 取絕對值衡量深度
+        mae_stats.append({
+            'Symbol': symbol,
+            'Total_Win_Trades': len(group),
+            'Avg_MAE_of_Wins_%': round(mae_series.mean(), 3),
+            'Median_MAE_of_Wins_%': round(mae_series.median(), 3),
+            '90th_Percentile_MAE_%': round(mae_series.quantile(0.90), 3)
+        })
+    mae_df = pd.DataFrame(mae_stats)
+
+    # ---------------------------------------------------------
+    # FILE EXPORT
+    # ---------------------------------------------------------
+    # 解析原本的匯出路徑，產生同目錄下的新檔案
+    base_dir = os.path.dirname(output_dir)
+    base_name = os.path.basename(output_dir).replace('.xlsx', '')
+    
+    corr_path = os.path.join(base_dir, f"{base_name}_Correlation_Matrix.csv")
+    mae_path = os.path.join(base_dir, f"{base_name}_MAE_Optimization.csv")
+    
+    corr_matrix.to_csv(corr_path)
+    mae_df.to_csv(mae_path, index=False)
+    
+    print("==================================================")
+    print(f"[*] Audit Report 1 Generated: {corr_path}")
+    print(f"[*] Audit Report 2 Generated: {mae_path}")
+    print("==================================================")
+
+    return corr_matrix, mae_df
 
 
 def discover_excel_files(paths: Iterable[str]) -> List[str]:
@@ -886,12 +1047,8 @@ def merge_and_export(excel_files: List[str], output_path: str) -> Tuple[pd.DataF
 
     merged = pd.concat(all_trades, ignore_index=True) if all_trades else pd.DataFrame()
 
-    try:
-        base_attrs = pd.read_excel(excel_files[0], sheet_name=ATTR_SHEET_NAME) if excel_files else None
-    except Exception:
-        base_attrs = None
-
-    perf, analysis, risk, trade_list_out, attrs = build_report_tables(merged, base_attrs)
+    base_attrs = _read_first_available_sheet(excel_files[0], ATTR_SHEET_NAMES) if excel_files else None
+    perf, analysis, risk, trade_list_out, attrs, equity_curve, stats_all = build_report_tables(merged, base_attrs)
 
     with pd.ExcelWriter(output_path, engine="openpyxl") as writer:
         perf.to_excel(writer, index=False, sheet_name="績效")
@@ -900,10 +1057,12 @@ def merge_and_export(excel_files: List[str], output_path: str) -> Tuple[pd.DataF
         trade_list_out.to_excel(writer, index=False, sheet_name="交易清單")
         attrs.to_excel(writer, index=False, sheet_name="屬性")
 
+    generate_quant_audit_reports(merged, output_path)
+
     return merged, analysis, risk
 
 
-def merge_and_export_to_bytes(excel_files: List[str]) -> bytes:
+def merge_and_export_to_bytes(excel_files: List[str]) -> Tuple[bytes, pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, Dict[str, Any]]:
     all_trades: List[pd.DataFrame] = []
 
     for f in excel_files:
@@ -912,12 +1071,11 @@ def merge_and_export_to_bytes(excel_files: List[str]) -> bytes:
         all_trades.append(trades)
 
     merged = pd.concat(all_trades, ignore_index=True) if all_trades else pd.DataFrame()
-    try:
-        base_attrs = pd.read_excel(excel_files[0], sheet_name=ATTR_SHEET_NAME) if excel_files else None
-    except Exception:
-        base_attrs = None
+    base_attrs = _read_first_available_sheet(excel_files[0], ATTR_SHEET_NAMES) if excel_files else None
+    perf, analysis, risk, trade_list_out, attrs, equity_curve, stats_all = build_report_tables(merged, base_attrs)
 
-    perf, analysis, risk, trade_list_out, attrs = build_report_tables(merged, base_attrs)
+    # Generate audit reports as well
+    corr_matrix, mae_df = generate_quant_audit_reports(merged, "memory_buffered_report.xlsx")
 
     buf = io.BytesIO()
     with pd.ExcelWriter(buf, engine="openpyxl") as writer:
@@ -927,7 +1085,7 @@ def merge_and_export_to_bytes(excel_files: List[str]) -> bytes:
         trade_list_out.to_excel(writer, index=False, sheet_name="交易清單")
         attrs.to_excel(writer, index=False, sheet_name="屬性")
 
-    return buf.getvalue()
+    return buf.getvalue(), perf, corr_matrix, mae_df, equity_curve, stats_all
 
 
 def main() -> int:
